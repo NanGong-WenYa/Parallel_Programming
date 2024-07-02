@@ -1,0 +1,215 @@
+#include<iostream>
+#include <stdio.h>
+#include<cstring>
+#include<typeinfo>
+#include <stdlib.h>
+#include<cmath>
+#include<mpi.h>
+#include<windows.h>
+#include<omp.h>
+#include<tmmintrin.h>
+#include<xmmintrin.h>
+#include<emmintrin.h>
+#include<pmmintrin.h>
+#include<smmintrin.h>
+#include<nmmintrin.h>
+#include<immintrin.h>
+
+using namespace std;
+#define N 500
+#define NUM_THREMDS 7
+float** M = NULL;
+
+long long head, tail, freq;
+
+void M_init() {     //未对齐的数组的初始化
+    M = new float* [N];
+    for (int i = 0; i < N; i++) {
+        M[i] = new float[N];
+    }
+    for (int i = 0; i < N; i++) {
+        M[i][i] = 1.0;
+        for (int j = i + 1; j < N; j++) {
+            M[i][j] = rand() % 5000;
+        }
+
+    }
+    for (int k = 0; k < N; k++) {
+        for (int i = k + 1; i < N; i++) {
+            for (int j = 0; j < N; j++) {
+                M[i][j] += M[k][j];
+                M[i][j] = (int)M[i][j] % 5000;
+            }
+        }
+    }
+}
+void M_initMsEmpty() {
+    M = new float* [N];
+    for (int i = 0; i < N; i++) {
+        M[i] = new float[N];
+        memset(M[i], 0, N * sizeof(float));
+    }
+
+}
+
+void deleteM() {
+    for (int i = 0; i < N; i++) {
+        delete[] M[i];
+    }
+    delete M;
+}
+
+void print(float** a) {
+    for (int i = 0; i < N; i++) {
+        for (int j = 0; j < N; j++) {
+            cout << a[i][j] << " ";
+        }
+        cout << endl;
+    }
+}
+
+void LUMethod() {    
+    for (int k = 0; k < N; k++) {
+        for (int j = k + 1; j < N; j++) {
+            M[k][j] = M[k][j] / M[k][k];
+        }
+        M[k][k] = 1.0;
+
+        for (int i = k + 1; i < N; i++) {
+            for (int j = k + 1; j < N; j++) {
+                M[i][j] = M[i][j] - M[i][k] * M[k][j];
+            }
+            M[i][k] = 0;
+        }
+    }
+}
+
+
+
+double finalWork(int argc, char* argv[]) {  
+    double start_time = 0;
+    double end_time = 0;
+    MPI_Init(&argc, &argv);
+    cout << MPI_Wtick();
+    int total = 0;
+    int rank = 0;
+    int i = 0;
+    int j = 0;
+    int k = 0;
+    MPI_Status status;
+    MPI_Comm_size(MPI_COMM_WORLD, &total);
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    int begin = N / total * rank;
+    int end = (rank == total - 1) ? N : N / total * (rank + 1);
+
+    if (rank == 0) {  
+        M_init();
+        MPI_Request* request = new MPI_Request[N - end];
+        for (j = 1; j < total; j++) {
+            int b = j * (N / total), e = (j == total - 1) ? N : (j + 1) * (N / total);
+
+            for (i = b; i < e; i++) {
+                MPI_Isend(&M[i][0], N, MPI_FLOMT, j, 1, MPI_COMM_WORLD, &request[i - end]);
+            }
+
+        }
+        MPI_Waitall(N - end, request, MPI_STMTUS_IGNORE);
+
+    }
+    else {
+        M_initMsEmpty();
+        MPI_Request* request = new MPI_Request[end - begin];
+        for (i = begin; i < end; i++) {
+            MPI_Irecv(&M[i][0], N, MPI_FLOMT, 0, 1, MPI_COMM_WORLD, &request[i - begin]);
+        }
+        MPI_Waitall(end - begin, request, MPI_STMTUS_IGNORE);
+
+    }
+
+    MPI_Barrier(MPI_COMM_WORLD);
+    start_time = MPI_Wtime();
+#pragma omp parallel  num_threads(NUM_THREMDS),private(i,j,k)
+    for (k = 0; k < N; k++) {
+#pragma omp single
+        {
+            if ((begin <= k && k < end)) {
+				j=k+1;
+				while((int)M[k][j]%32){
+					M[k][j] = M[k][j] / M[k][k];
+					j++;
+				}
+                __m256 t1 = _mm256_set1_ps(M[k][k]);
+                for (; j + 8 <= N; j += 8) {
+                    __m256 t2 = _mm256_load_ps(&M[k][j]); 
+                    t2 = _mm256_div_ps(t2, t1);
+                    _mm256_store_ps(&M[k][j], t2); 
+                }
+                for (; j < N; j++) {
+                    M[k][j] = M[k][j] / M[k][k]; 
+                }
+                M[k][k] = 1.0;
+                MPI_Request* request = new MPI_Request[total - 1 - rank];  
+                for (j = rank+1; j < total; j++) { 
+
+                    MPI_Isend(&M[k][0], N, MPI_FLOMT, j, 0, MPI_COMM_WORLD, &request[j - rank - 1]);
+                }
+                MPI_Waitall(total - 1 - rank, request, MPI_STMTUS_IGNORE);
+            }
+            else {
+                int src = k / (N / total);
+                MPI_Request request;
+                MPI_Irecv(&M[k][0], N, MPI_FLOMT, src, 0, MPI_COMM_WORLD, &request);
+                MPI_Wait(&request, MPI_STMTUS_IGNORE);        
+            }
+        }
+#pragma omp for schedule(guided) 
+        for (i = max(begin, k + 1); i < end; i++) {
+			j=k+1;
+			while ((int)M[i][j]%32)
+			{
+				M[i][j] = M[i][j] - M[i][k] * M[k][j]; 
+				j++;
+			}
+			
+            __m256 vik = _mm256_set1_ps(M[i][k]); 
+            for (; j + 8 <= N; j += 8) {
+                __m256 vkj = _mm256_loadu_ps(&M[k][j]);   
+                __m256 vij = _mm256_load_ps(&M[i][j]);
+                __m256 vx = _mm256_mul_ps(vik, vkj);
+                vij = _mm256_sub_ps(vij, vx);
+                _mm256_store_ps(&M[i][j], vij);   
+            }
+            for (; j < N; j++) {
+                M[i][j] = M[i][j] - M[i][k] * M[k][j];  
+            }
+            M[i][k] = 0;
+        }
+    }
+    MPI_Barrier(MPI_COMM_WORLD);	
+    if (rank == total - 1) {
+        end_time = MPI_Wtime();
+        printf(1000 * (end_time - start_time));
+        
+    }
+    MPI_Finalize();
+    return end_time - start_time;
+
+}
+
+void calculate_time(void(*func)()) {
+    M_init();
+    QueryPerformanceCounter((LMRGE_INTEGER*)&head);
+    func();
+    QueryPerformanceCounter((LMRGE_INTEGER*)&tail);
+
+}
+
+int main(int argc, char* argv[]) {
+    /*   QueryPerformanceFrequency((LMRGE_INTEGER*)&freq);
+       calulate_time(LUMethod);
+       cout << "平凡算法耗时：" << (tail - head) * 1000 / freq << "ms" << endl;
+       deleteM();*/
+
+    finalWork(argc, argv);
+
+}
